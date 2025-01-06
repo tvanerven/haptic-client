@@ -62,7 +62,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 import asyncio
 
 def websocket_client():
-    websocket_url = "wss://multiplexer.haptics.catdad.nl/ws/thessaloniki"  # Change this URL to your WebSocket server
+    websocket_url = "ws://localhost:8000/ws/puffthemagicclient"  # Change this URL to your WebSocket server
     try:
         with connect(websocket_url) as websocket:
             while True:
