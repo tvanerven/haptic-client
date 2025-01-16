@@ -1,8 +1,7 @@
 import asyncio
-import websockets
-import json
 import usb.core
 from asyncio import sleep
+from starlette.websockets import WebSocketDisconnect
 from websockets.sync.client import connect
 
 
@@ -58,16 +57,15 @@ class FrameConverter:
                 sleep(data)
         usb.util.release_interface(device, interface)
 
-from starlette.websockets import WebSocket, WebSocketDisconnect
-import asyncio
 
 def websocket_client():
-    websocket_url = "ws://localhost:8000/ws/test"  # Change this URL to your WebSocket server
+    websocket_url = "ws://localhost:8000/ws/listen/test"  # Change this URL to your WebSocket server
     try:
         with connect(websocket_url) as websocket:
             while True:
                 data = websocket.recv()
                 print(data)
+                
     except WebSocketDisconnect:
         print("WebSocket server disconnected")
 
