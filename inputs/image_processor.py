@@ -9,9 +9,9 @@ class Position(BaseModel):
 
 
 class Color(BaseModel):
-    r: str
-    g: str
-    b: str
+    r: int
+    g: int
+    b: int
 
 
 class ImageProcessorInput(BaseModel, InputBaseMixin):
@@ -33,7 +33,7 @@ class ImageProcessorInput(BaseModel, InputBaseMixin):
                                         self.color.r,
                                         self.color.g,
                                         self.color.b,
-                                    ],
+                                    ] + [0 for _ in range(15)],
                                 ),
                             ]
                         )
