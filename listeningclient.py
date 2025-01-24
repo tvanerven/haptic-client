@@ -2,7 +2,9 @@ import asyncio
 import usb.core
 from asyncio import sleep
 from starlette.websockets import WebSocketDisconnect
-from websockets.sync.client import connect
+
+from clients.spnclient import SPNClient
+from skinetic.skineticSDK import Skinetic
 
 
 class FrameConverter:
@@ -58,19 +60,16 @@ class FrameConverter:
         usb.util.release_interface(device, interface)
 
 
-def websocket_client():
+async def websocket_client():
     websocket_url = "ws://localhost:8000/ws/listen/test"  # Change this URL to your WebSocket server
     try:
-        with connect(websocket_url) as websocket:
-            while True:
-                data = websocket.recv()
-                print(data)
-                
+        async with SPNClient(skinetic=Skinetic(), uri=websocket_url) as websocket:
+            await websocket.process_messages()         
     except WebSocketDisconnect:
         print("WebSocket server disconnected")
 
-def main():
-    websocket_client()
+async def main():
+    await websocket_client()
 
 if __name__ == "__main__":
     asyncio.run(main())

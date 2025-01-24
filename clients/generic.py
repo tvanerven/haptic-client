@@ -1,18 +1,27 @@
 from asyncio import sleep
-from websockets.sync.client import connect
+from websockets import connect
 
 class WebsocketClient:
-    async def connect(self, uri):
-        self.websocket = await connect(uri)
+    def __init__(self, uri):
+        self.uri = uri
+        self.websocket = None
+
+    async def __aenter__(self):
+        self.websocket = await connect(self.uri)
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        if self.websocket:
+            await self.websocket.close()
+            self.websocket = None
 
     async def send(self, message):
-        await self.websocket.send(message)
+        if self.websocket:
+            await self.websocket.send(message)
 
     async def receive(self):
-        return await self.websocket.recv()
-    
-    async def disconnect(self):
-        await self.websocket.close()
+        if self.websocket:
+            return await self.websocket.recv()
 
     async def listen(self):
         while True:
