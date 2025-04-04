@@ -14,9 +14,14 @@ class Color(BaseModel):
     b: int
 
 
-class ImageProcessorInput(BaseModel, InputBaseMixin):
+class ImageData(BaseModel):
     position: Position
     color: Color
+
+
+class ImageProcessorInput(BaseModel, InputBaseMixin):
+    image_data: ImageData
+    intensity: float
 
     def format(self) -> Output:
         return Output(
@@ -28,11 +33,11 @@ class ImageProcessorInput(BaseModel, InputBaseMixin):
                             spatKeyframes=[
                                 SpatKeyFrame(
                                     weights=[
-                                        self.position.x,
-                                        self.position.y,
-                                        self.color.r,
-                                        self.color.g,
-                                        self.color.b,
+                                        self.image_data.position.x,
+                                        self.image_data.position.y,
+                                        self.image_data.color.r,
+                                        self.image_data.color.g,
+                                        self.image_data.color.b,
                                     ] + [0 for _ in range(15)],
                                 ),
                             ]
