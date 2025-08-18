@@ -17,10 +17,11 @@ import serial  # pip install pyserial
 from websockets.sync.client import connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
+
 # =========================
 # Config / paths
 # =========================
-APP_FAMILY = "bhx-bridge"
+APP_FAMILY = "haptic-bridge"
 DEFAULT_CONFIG_NAME = "config.yaml"
 DEFAULT_LOG_NAME = "rpi_client.log"
 

@@ -19,7 +19,7 @@ jobs:
             python:3.12-bookworm bash -lc "
               pip install --upgrade pip wheel &&
               pip install pyinstaller pyyaml websockets pyserial sentry-sdk &&
-              pyinstaller --onefile --console --name rpi_client --hidden-import sentry_sdk rpi_client.py
+              pyinstaller --onefile --console --name rpi_client --hidden-import sentry_sdk exp_client.py
             "
 
       - uses: actions/upload-artifact@v4
