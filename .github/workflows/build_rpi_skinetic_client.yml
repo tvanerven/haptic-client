@@ -1,0 +1,30 @@
+name: build-rpi5-arm64
+on:
+    push:
+        paths:
+            "spn_color_haptic_client.py"
+
+jobs:
+  build-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable QEMU binfmt
+        run: docker run --privileged --rm tonistiigi/binfmt --install all
+
+      - name: Build ARM64 onefile with PyInstaller
+        run: |
+          docker run --rm --platform linux/arm64/v8 -v "$PWD":/src -w /src \
+            python:3.12-bookworm bash -lc "
+              pip install --upgrade pip wheel &&
+              # Install your project and its deps (prefer requirements.txt if present)
+              if [ -f requirements.txt ]; then pip install -r requirements.txt; fi &&
+              pip install pyinstaller sentry-sdk pyyaml &&
+              pyinstaller --onefile --console --name spn_client --hidden-import sentry_sdk spn_color_haptic_client.py
+            "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spn-client-arm64
+          path: dist/spn_client
