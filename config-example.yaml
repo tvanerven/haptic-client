@@ -1,7 +1,19 @@
 ws_url: "wss://host:8000"
 client_id: "hotrod"
 debug: false
-glitchtip_dsn: ""   # optional
+environment: "raspbian"
+glitchtip_dsn: ""
+
+# "serial" | "skinetic" | "both"
+output: "both"
+
+serial:
+  port: "/dev/ttyACM0"
+  baudrate: 9600
+
+skinetic:
+  output_type: "USB"   # maps to Skinetic.OutputType.USB
+
 ping_interval: 25
 ping_timeout: 10
 reconnect_initial: 2
