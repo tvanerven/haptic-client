@@ -6,17 +6,41 @@ import time
 import logging
 from logging import Logger
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Union, Optional
 
 # ---- Optional: remote troubleshooting via Glitchtip/Sentry
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
 
 # ---- IO
-import serial  # pip install pyserial
+try:
+    import serial  # pip install pyserial
+except Exception:
+    serial = None
+
 from websockets.sync.client import connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
+# ---- Skinetic + your SPN pipeline bits
+try:
+    from skinetic.skineticSDK import Skinetic
+    from inputs.haptidesigner import FrameConverter as HDFrameConverter
+    from inputs.image_processor import HapticProcessorInput
+    from outputs.schemas import Output
+except Exception:
+    Skinetic = None  # allow running on boxes without the SDK
+    HDFrameConverter = None
+    HapticProcessorInput = None
+    Output = None
+
+def _pp_json(obj: Any, limit: int = 2000) -> str:
+    try:
+        s = json.dumps(obj, ensure_ascii=False, indent=2)
+    except Exception:
+        s = str(obj)
+    if len(s) > limit:
+        s = s[:limit] + " ... (truncated)"
+    return s
 
 # =========================
 # Config / paths
@@ -43,7 +67,7 @@ def bundled_base_dir() -> Path:
 
 def user_config_dir() -> Path:
     """
-    Follow Linux conventions: ~/.config/bhx-bridge
+    Follow Linux conventions: ~/.config/haptic-bridge
     """
     return Path.home() / ".config" / APP_FAMILY
 
@@ -51,7 +75,7 @@ def user_config_dir() -> Path:
 def find_config_path() -> Path:
     """
     Priority:
-    1) ~/.config/bhx-bridge/config.yaml  (user-editable, persisted)
+    1) ~/.config/haptic-bridge/config.yaml  (user-editable, persisted)
     2) same folder as script/binary
     """
     p1 = user_config_dir() / DEFAULT_CONFIG_NAME
@@ -93,15 +117,24 @@ def _as_bool(v) -> bool:
 
 def env_override(cfg: dict) -> dict:
     """
-    Environment overrides (keep parity with Windows client):
+    Environment overrides:
       BHX_WS_URL, BHX_CLIENT_ID, BHX_DEBUG,
       BHX_SENTRY_DSN or BHX_GLITCHTIP_DSN,
-      BHX_SERIAL_PORT, BHX_SERIAL_BAUD
+      BHX_SERIAL_PORT, BHX_SERIAL_BAUD,
+      BHX_DEVICE (auto|serial|skinetic|both),
+      BHX_SKINETIC_OUTPUT (USB|...)
     """
     cfg["ws_url"] = os.getenv("BHX_WS_URL", cfg.get("ws_url", ""))
     cfg["client_id"] = os.getenv("BHX_CLIENT_ID", cfg.get("client_id", ""))
+
     if "BHX_DEBUG" in os.environ:
         cfg["debug"] = _as_bool(os.getenv("BHX_DEBUG"))
+
+    # Device selector (which output backend to use)
+    cfg["device"] = (os.getenv("BHX_DEVICE", cfg.get("device", "serial")) or "serial").lower()
+    # allow "both" if you want to fan out to both devices
+    if cfg["device"] not in ("auto", "serial", "skinetic", "both"):
+        cfg["device"] = "serial"
 
     # Sentry/Glitchtip
     cfg["glitchtip_dsn"] = os.getenv(
@@ -113,6 +146,10 @@ def env_override(cfg: dict) -> dict:
     cfg["serial"] = cfg.get("serial", {})
     cfg["serial"]["port"] = os.getenv("BHX_SERIAL_PORT", cfg["serial"].get("port", ""))  # e.g., /dev/ttyACM0
     cfg["serial"]["baudrate"] = int(os.getenv("BHX_SERIAL_BAUD", cfg["serial"].get("baudrate", 9600)))
+
+    # Skinetic
+    cfg["skinetic"] = cfg.get("skinetic", {})
+    cfg["skinetic"]["output_type"] = os.getenv("BHX_SKINETIC_OUTPUT", cfg["skinetic"].get("output_type", "USB"))
 
     return cfg
 
@@ -137,10 +174,15 @@ def load_config(logger: Logger) -> dict:
     ws_url: "wss://host:8000"
     client_id: "moorchyk1"
     debug: false
-    glitchtip_dsn: ""   # your Glitchtip project DSN (optional)
+    glitchtip_dsn: ""   # optional
+    device: "auto"      # "auto" | "serial" | "skinetic" | "both"
+
     serial:
       port: "/dev/ttyACM0"
       baudrate: 9600
+
+    skinetic:
+      output_type: "USB"
     """
     cfg_path = find_config_path()
     cfg = load_yaml(cfg_path) if cfg_path.exists() else {}
@@ -152,14 +194,14 @@ def load_config(logger: Logger) -> dict:
         cfg["client_id"] = input("Enter client ID (e.g., moorchyk1): ").strip()
 
     if not cfg.get("ws_url"):
-        ws = input("Enter WebSocket URL (e.g., wss://host:8000): ").strip()
+        ws = input("Enter WebSocket base (e.g., wss://host:8000): ").strip()
         cfg["ws_url"] = sanitize_websocket_url(ws, cfg["client_id"])
     else:
         cfg["ws_url"] = sanitize_websocket_url(cfg["ws_url"], cfg["client_id"])
 
     cfg["debug"] = _as_bool(cfg.get("debug", False))
 
-    # Persist to ~/.config/bhx-bridge
+    # Persist to ~/.config/haptic-bridge
     save_to = user_config_dir() / DEFAULT_CONFIG_NAME
     dump_yaml(save_to, cfg)
     logger.info(f"Config loaded. Saved to: {save_to}")
@@ -214,7 +256,7 @@ def setup_sentry(dsn: str, logger: Logger, environment: str = "raspbian"):
 # =========================
 # Frame conversion → serial
 # =========================
-class FrameConverter:
+class SerialFrameConverter:
     """
     Converts a payload into a flat stream of serial commands:
       - For each frame_node: "[L,{node_index}:{intensity}]"
@@ -271,6 +313,20 @@ class FrameConverter:
             self._parse_frames(self.sentence, label="list")
         else:
             raise TypeError(f"Unsupported sentence type: {type(self.sentence)}")
+        
+    def dump_preview(self, logger: Logger, max_lines: int = 200):
+        """Pretty-print the converted serial script."""
+        logger.debug("=== SERIAL CONVERSION (items=%d) ===", len(self._data))
+        shown = 0
+        for idx, item in enumerate(self._data):
+            if isinstance(item, str):
+                logger.debug("  %03d CMD %s", idx, item)
+            else:
+                logger.debug("  %03d SLP %d ms", idx, item)
+            shown += 1
+            if shown >= max_lines:
+                logger.debug("  ... (truncated)")
+                break
 
     def _parse_frames(self, frames: List[Dict[str, Any]], label: str = "") -> None:
         for idx_frame, frame in enumerate(frames):
@@ -316,32 +372,138 @@ class FrameConverter:
             # append duration at the end of each frame
             self._data.append(dur)
 
-    def get_serial_device(self, port: str, baudrate: int = 9600):
-        ser = serial.Serial(port, baudrate, timeout=1)
+    def get_serial_device(self, port: str, baudrate: int = 9600, terminator: str = "\n"):
+        if serial is None:
+            raise RuntimeError("pyserial is not installed")
+        ser = serial.Serial(
+            port=port,
+            baudrate=baudrate,
+            timeout=1,
+            write_timeout=1,   # avoid blocking forever on write
+            dsrdtr=False,
+            rtscts=False,
+        )
+        # Some boards need a brief settle and DTR pulse
+        try:
+            ser.dtr = True
+            ser.rts = False
+        except Exception:
+            pass
+        time.sleep(0.05)
         if not ser.is_open:
             ser.open()
+        setattr(ser, "_bhx_term", terminator)
+        self._logger.info(f"Serial opened: {port} @ {baudrate}")
         return ser
 
     def send_serial_data(self, serial_device, data: List[Union[str, int]], logger: Logger) -> None:
         """
         Stream prepared data to the serial device with pacing.
         """
+        # get terminator from config if present; default newline
+        term = "\n"
+        try:
+            # serial_device is created by get_serial_device; we can stash the chosen terminator on it
+            term = getattr(serial_device, "_bhx_term", "\n")
+        except Exception:
+            pass
+
+        current_delay_ms = 0
         for item in data:
             if isinstance(item, str):
                 try:
-                    encoded = item.encode("utf-8")
-                    max_packet_size = 64  # typical USB CDC packet size
-                    for i in range(0, len(encoded), max_packet_size):
-                        chunk = encoded[i:i + max_packet_size]
+                    payload = (item + term).encode("utf-8")
+                    max_packet_size = 64
+                    for i in range(0, len(payload), max_packet_size):
+                        chunk = payload[i:i + max_packet_size]
                         logger.info(f"Sending chunk: {chunk!r}")
                         serial_device.write(chunk)
                         serial_device.flush()
-                        time.sleep(0.05)  # small inter-chunk delay
-                except serial.SerialTimeoutException as e:
-                    logger.error(f"Serial timeout while sending data: {e}")
+                        time.sleep(0.02)
+                except Exception as e:
+                    logger.error(f"Serial error while sending data: {e}")
+
             elif isinstance(item, int):
-                # Duration is in ms
-                time.sleep(max(0, item) / 1000.0)
+                # End of frame: wait duration, then send a stop/clear packet
+                current_delay_ms = max(0, item)
+                time.sleep(current_delay_ms / 1000.0)
+                try:
+                    stop = ("[L,all:0]" + term).encode("utf-8")
+                    serial_device.write(stop)
+                    serial_device.flush()
+                    time.sleep(0.02)
+                    logger.info(f"Frame stop sent after {current_delay_ms}ms")
+                except Exception as e:
+                    logger.error(f"Serial error while sending stop: {e}")
+
+
+# =========================
+# Skinetic output (SPN path)
+# =========================
+class SkineticSenderSPN:
+    """
+    Mirrors your SPNClient behavior using your models/utilities.
+    """
+    def __init__(self, logger: Logger, output_type: str = "USB"):
+        self.logger = logger
+        self.dev: Optional[Skinetic] = None
+        self.output_type = output_type
+        self.available = all([Skinetic, HDFrameConverter, HapticProcessorInput, Output])
+
+    def connect(self):
+        if not self.available:
+            self.logger.warning("Skinetic pipeline not available (missing SDK or inputs/outputs modules).")
+            return
+        if self.dev:
+            return
+        try:
+            self.dev = Skinetic()
+            ot = getattr(Skinetic.OutputType, self.output_type, Skinetic.OutputType.USB)
+            self.dev.connect(output_type=ot)
+            self.logger.info(f"Skinetic connected (output_type={self.output_type}).")
+        except Exception:
+            self.logger.exception("Failed to connect Skinetic device")
+            self.dev = None
+
+    def send_payload(self, payload: Union[Dict[str, Any], List[Dict[str, Any]]]):
+        if not self.available:
+            return
+        if not self.dev:
+            self.connect()
+        if not self.dev:
+            return
+
+        try:
+            frames = HDFrameConverter(payload)._skinetic  # [{order,node_index,intensity,duration}, ...]
+            msg = HapticProcessorInput(frame_list=frames)
+            output: Output = msg.format()
+            js = output.model_dump_json()
+            if self.dev.get_connection_state() == self.dev.ConnectionState.Connected:
+                pattern_id = self.dev.load_pattern_json(js)
+                self.dev.play_effect(pattern_id)
+                self.dev.unload_pattern(pattern_id)
+            else:
+                self.logger.warning("Skinetic not connected; dropping message.")
+        except Exception:
+            self.logger.exception("Skinetic send failed")
+
+    def dump_preview(self, payload: Union[Dict[str, Any], List[Dict[str, Any]]], logger: Logger):
+        """Pretty-print _skinetic frames and the final Output JSON (without sending)."""
+        if not self.available:
+            logger.debug("Skinetic dump skipped (SDK or models not available).")
+            return
+        try:
+            frames = HDFrameConverter(payload)._skinetic
+            logger.debug("=== SKINETIC _skinetic frames (n=%d) ===", len(frames))
+            for i, f in enumerate(frames[:50]):  # cap spam
+                logger.debug("  %03d %s", i, f)
+            if len(frames) > 50:
+                logger.debug("  ... (truncated)")
+            msg = HapticProcessorInput(frame_list=frames)
+            output: Output = msg.format()
+            logger.debug("=== SKINETIC Output JSON ===\n%s", _pp_json(output.model_dump(), limit=5000))
+        except Exception:
+            logger.exception("Failed to dump Skinetic preview")
 
 
 # =========================
@@ -350,10 +512,35 @@ class FrameConverter:
 def websocket_client(cfg: dict, logger: Logger):
     websocket_url = cfg["ws_url"]
     debug = _as_bool(cfg.get("debug", False))
+    device_mode = (cfg.get("device") or cfg.get("output") or "serial").lower()  # auto | serial | skinetic | both
+    if device_mode not in ("auto", "serial", "skinetic", "both"):
+        device_mode = "serial"
+    logger.info(f"Output device mode: {device_mode}")
 
     serial_cfg = cfg.get("serial", {})
+    term = cfg.get("serial", {}).get("terminator", "\n")
     serial_port = serial_cfg.get("port") or ""
     serial_baud = int(serial_cfg.get("baudrate", 9600))
+
+    skinetic_cfg = cfg.get("skinetic", {})
+    skinetic_output_type = skinetic_cfg.get("output_type", "USB")
+    skinetic_sender = SkineticSenderSPN(logger, output_type=skinetic_output_type) if device_mode in ("skinetic", "both", "auto") else None
+
+    # In "auto" mode, prefer Skinetic if it's available and can connect; else fall back to serial if configured.
+    def resolve_auto_choice() -> str:
+        if skinetic_sender and skinetic_sender.available:
+            try:
+                skinetic_sender.connect()
+                if skinetic_sender.dev and skinetic_sender.dev.get_connection_state() == skinetic_sender.dev.ConnectionState.Connected:
+                    logger.info("Auto device select: Skinetic")
+                    return "skinetic"
+            except Exception:
+                logger.exception("Skinetic auto-connect failed")
+        if serial_port:
+            logger.info("Auto device select: Serial")
+            return "serial"
+        logger.warning("Auto device select: No suitable device configured; logging only")
+        return "none"
 
     backoff_s = 2
     max_backoff_s = 30
@@ -361,12 +548,10 @@ def websocket_client(cfg: dict, logger: Logger):
     while True:
         try:
             logger.info(f"Connecting to {websocket_url} ...")
-            # Consider adding ping_interval / timeouts if your server expects protocol pings
             with connect(websocket_url, ping_interval=25, ping_timeout=10, close_timeout=5) as ws:
                 logger.info("Connected.")
                 backoff_s = 2  # reset backoff on success
 
-                # Iterate incoming messages until the server closes the socket.
                 for raw in ws:
                     if raw is None:
                         continue
@@ -390,6 +575,7 @@ def websocket_client(cfg: dict, logger: Logger):
                     # Normal payload: expect JSON
                     try:
                         payload = json.loads(raw)
+                        logger.debug("WS PAYLOAD:\n%s", _pp_json(payload, limit=4000))
                     except json.JSONDecodeError:
                         logger.warning("Received non-JSON message; ignoring.")
                         continue
@@ -400,21 +586,54 @@ def websocket_client(cfg: dict, logger: Logger):
                         continue
 
                     try:
-                        fc = FrameConverter(sentence=payload, logger=logger, debug=debug)
+                        # Decide device(s)
+                        choice = device_mode
+                        if device_mode == "auto":
+                            choice = resolve_auto_choice()
 
-                        # SERIAL OUTPUT (enable if configured)
-                        if serial_port:
-                            try:
-                                dev = fc.get_serial_device(port=serial_port, baudrate=serial_baud)
-                                fc.send_serial_data(dev, fc._data, logger)
-                            except Exception:
-                                logger.exception("Serial send failed")
-                        else:
-                            # If no serial configured, just log the conversion when debug is on.
+                        # --- Always build and dump the serial conversion in debug ---
+                        fc = SerialFrameConverter(sentence=payload, logger=logger, debug=False)
+                        if debug:
+                            fc.dump_preview(logger)
+
+                        # --- Always build and dump the Skinetic conversion in debug (if libs present) ---
+                        if skinetic_sender and skinetic_sender.available and debug:
+                            skinetic_sender.dump_preview(payload, logger)
+
+                        # SERIAL OUTPUT (only if chosen and configured)
+                        if choice in ("serial", "both"):
+                            if serial_port and serial is not None:
+                                try:
+                                    dev = fc.get_serial_device(port=serial_port, baudrate=serial_baud, terminator=term)
+                                    fc.send_serial_data(dev, fc._data, logger)
+                                    if debug:
+                                        logger.debug("[serial] send complete")
+                                except Exception:
+                                    logger.exception("Serial send failed")
+                            else:
+                                if debug:
+                                    logger.debug("Serial not configured; skipping actual serial send.")
+
+                        # SKINETIC OUTPUT (only if chosen)
+                        if choice in ("skinetic", "both"):
+                            if skinetic_sender and skinetic_sender.available:
+                                try:
+                                    skinetic_sender.send_payload(payload)
+                                    if debug:
+                                        logger.debug("[skinetic] send complete")
+                                except Exception:
+                                    logger.exception("Skinetic send failed")
+                            else:
+                                if debug:
+                                    logger.debug("Skinetic not available; skipping actual skinetic send.")
+
+                        # NONE (auto could not resolve)
+                        if choice not in ("serial", "skinetic", "both"):
                             if debug:
-                                logger.info("No serial port configured; frames logged only.")
+                                logger.info("No output device selected; payload processed but not sent.")
+
                     except Exception:
-                        logger.exception("Error during frame handling")
+                        logger.exception("Error during message handling")
 
         except (ConnectionClosed, WebSocketException) as e:
             logger.warning(f"WebSocket closed: {e}. Reconnecting in {backoff_s}s ...")
@@ -435,14 +654,20 @@ def websocket_client(cfg: dict, logger: Logger):
 # =========================
 def main():
     logger = setup_logging()
-
-    # Load config and set up Glitchtip/Sentry
     try:
         cfg = load_config(logger)
     except Exception:
-        # log to file/console and still try to continue with defaults
         logger.exception("Failed to load config; continuing with partial defaults.")
-        cfg = {"ws_url": "", "client_id": "", "debug": False, "serial": {}}
+        cfg = {"ws_url": "", "client_id": "", "debug": False, "device": "serial", "serial": {}, "skinetic": {}}
+
+    # NEW: honor debug by raising log level to DEBUG
+    if _as_bool(cfg.get("debug", False)):
+        logger.setLevel(logging.DEBUG)
+        for h in logger.handlers:
+            h.setLevel(logging.DEBUG)
+        logger.debug("Debug logging enabled.")
+
+    setup_sentry(cfg.get("glitchtip_dsn", ""), logger)
 
     setup_sentry(cfg.get("glitchtip_dsn", ""), logger)
 
