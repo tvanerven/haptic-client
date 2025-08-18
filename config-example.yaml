@@ -1,0 +1,8 @@
+ws_url: "wss://host:8000"
+client_id: "hotrod"
+debug: false
+glitchtip_dsn: ""   # optional
+ping_interval: 25
+ping_timeout: 10
+reconnect_initial: 2
+reconnect_max: 30
