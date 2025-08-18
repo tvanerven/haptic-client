@@ -17,6 +17,7 @@ import serial  # pip install pyserial
 from websockets.sync.client import connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
+
 # =========================
 # Config / paths
 # =========================

@@ -3,6 +3,7 @@ on:
   push:
     paths:
       - 'exp_client.py'
+      - '**/**/build_rpi_listener_haptidesigner.yml'
 
 jobs:
   build-arm64:
