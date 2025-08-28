@@ -204,8 +204,11 @@ class ColorToSerial:
         except Exception: return default
 
     def _parse(self, p: Dict[str, Any]) -> None:
-        color = p.get("color", {}) or {}
-        r = self._to_int(color.get("r", 0)); g = self._to_int(color.get("g", 0)); b = self._to_int(color.get("b", 0))
+        color = p.get("image_data", {}).get("color", {}) or {}
+        self.logger.info(f"Color payload: {color}")
+        r = self._to_int(color.get("r"))
+        g = self._to_int(color.get("g"))
+        b = self._to_int(color.get("b"))
         intensity = self._to_int(p.get("intensity", 255), 255)
 
         def scale(chan: int) -> int:
@@ -368,13 +371,14 @@ class SkineticSenderSPN:
             self.dev.play_effect(pattern_id)
             self.dev.unload_pattern(pattern_id)
         else:
+            self.logger.info(f"Output would be: {js}")
             self.logger.warning("Skinetic not connected; dropping contour message.")
 
     def send_color(self, payload: Dict[str, Any]):
         self._ensure_connected()
         # Scale color → intensities like serial path, then build a minimal frame list
-        color = (payload or {}).get("color", {}) or {}
-        intensity = int((payload or {}).get("intensity", 255))
+        color = (payload or {}).get("image_data", {}).get("color") or {}
+        intensity = int((payload or {}).get("intensity", 100))
         duration = int((payload or {}).get("duration", 160))
 
         def scale(chan: Any) -> int:
@@ -392,8 +396,8 @@ class SkineticSenderSPN:
         # three nodes: 9 (R), 6 (G), 4 (B)
         frames = [
             {"order": 0, "node_index": 9, "intensity": rS, "duration": duration},
-            {"order": 1, "node_index": 6, "intensity": gS, "duration": duration},
-            {"order": 2, "node_index": 4, "intensity": bS, "duration": duration},
+            {"order": 0, "node_index": 6, "intensity": gS, "duration": duration},
+            {"order": 0, "node_index": 4, "intensity": bS, "duration": duration},
         ]
         msg = HapticProcessorInput(frame_list=frames)
         output: Output = msg.format()
@@ -403,6 +407,7 @@ class SkineticSenderSPN:
             self.dev.play_effect(pattern_id)
             self.dev.unload_pattern(pattern_id)
         else:
+            self.logger.info(f"Output would be: {js}")
             self.logger.warning("Skinetic not connected; dropping color message.")
 
 # =========================
@@ -415,8 +420,9 @@ class Mode:
 
 def detect_mode(payload: Any) -> Optional[str]:
     if isinstance(payload, dict):
-        if "color" in payload:
-            return Mode.COLOR
+        if "image_data" in payload:
+            if "color" in payload["image_data"]:
+                return Mode.COLOR
         for v in payload.values():
             if isinstance(v, dict) and "frame_nodes" in v:
                 return Mode.CONTOUR
@@ -503,11 +509,20 @@ def websocket_loop(cfg: dict, logger: Logger):
                             except Exception: pass
                         elif cmd == "set_mode":
                             value = str(payload.get("value", "")).lower()
-                            if value in (Mode.COLOR, Mode.CONTOUR, Mode.AUTO):
+                            # accept JS synonyms
+                            aliases = {
+                                "concepts": "auto",
+                                "contours": "contour",
+                                "notes": "auto",
+                            }
+                            value = aliases.get(value, value)
+                            if value in (Mode.COLOR, Mode.CONTOUR, Mode.AUTO):  # likely "color","contour","auto"
                                 mode = value
                                 logger.info(f"Mode switched to: {mode}")
-                                try: ws.send(json.dumps({"ok": True, "mode": mode}))
-                                except Exception: pass
+                                try:
+                                    ws.send(json.dumps({"ok": True, "mode": mode}))
+                                except Exception:
+                                    pass
                         elif cmd == "get_mode":
                             try: ws.send(json.dumps({"mode": mode}))
                             except Exception: pass
@@ -527,10 +542,17 @@ def websocket_loop(cfg: dict, logger: Logger):
                         try:
                             if effective_mode == Mode.COLOR:
                                 sconv = ColorToSerial(payload, logger)
-                                serial_sender.send(sconv.data)
+                                if debug: 
+                                    logger.info(f"[serial] would send: {sconv.data}")
+                                else:
+                                    serial_sender.send(sconv.data)
                             else:
                                 sconv = ContourToSerial(payload, logger)
-                                serial_sender.send(sconv.data)
+                                if debug:
+                                    logger.info(f"[serial] would send: {sconv.data}")
+                                
+                                else:
+                                    serial_sender.send(sconv.data)
                             if debug: logger.info("[serial] sent")
                         except Exception:
                             logger.exception("Serial send failed")

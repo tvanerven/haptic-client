@@ -5,20 +5,20 @@ import serial
 import time
 from asyncio import sleep
 from websockets.sync.client import connect
+from inputs.image_processor import ImageProcessorInput, HapticProcessorInput
 
 
-class FrameConverter:
+class ColorConverter:
 
-    def __init__(self, sentence: dict):
-        self.sentence = sentence
-        print("Sentence received: ", self.sentence)
-        self._frames = None 
+    def __init__(self, colordata: dict):
+        self.color = colordata
+        print("color received: ", self.color)
         self._data = []
         self._rawstring = ""
-        self._parse_sentence()
+        self._parse_colors()
         print("Converted to following: ", self._data)
-        #self.device = self.get_serial_device(port='/dev/ttyACM0', baudrate=9600)
-        #self.send_serial_data(self.device, self._data)
+        self.device = self.get_serial_device(port='/dev/ttyACM0', baudrate=9600)
+        self.send_serial_data(self.device, self._data)
         super().__init__()
 
     def get_serial_device(self, port, baudrate=9600):
@@ -26,18 +26,13 @@ class FrameConverter:
         if not ser.is_open:
             ser.open()
         return ser
+    
+    def _parse_colors(self):
+        print("Color: ", self.color)
+        # color = ImageProcessorInput(color)
 
-    def _parse_sentence(self):
-        for word in self.sentence:
-            self._parse_frames(self.sentence[word])
-            #self._raw.append(sleep(500))
-
-    def _parse_frames(self, word):
-        for frame in word:
-            for frame_nodes in frame['frame_nodes']:
-                content = f"[L,{frame_nodes['node_index']}:{frame_nodes['intensity']}]"
-                self._data.append(content)
-            self._data.append(int(frame['duration']))
+        self._data.append(f"[L,0-15:{self.color['intensity']}]")
+        self._data.append(160)
 
     def send_serial_data(self, serial_device, data):
         for item in data:
@@ -56,19 +51,24 @@ class FrameConverter:
                     print(f"Error sending data: {e}")
             if isinstance(item, int):
                 time.sleep(item / 1000)  # Convert milliseconds to seconds
-                print(f"Sleeping for {item} ms")
+                stop_instruction = "[L,all:0]".encode('utf-8')
+                serial_device.write(stop_instruction)
+                serial_device.flush()
+                time.sleep(0.1)
+                print("Stop instruction sent successfully")
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 import asyncio
 
 def websocket_client():
-    websocket_url = "ws://localhost:8000/ws/listen/moorchyk1"  # Change this URL to your WebSocket server
+    websocket_url = "ws://localhost:8000/ws/listen/test"  # Change this URL to your WebSocket server
     try:
         with connect(websocket_url) as websocket:
             while True:
                 data = websocket.recv()
+                print(data)
                 json_data = json.loads(data)
-                FrameConverter(sentence=json_data)
+                ColorConverter(colordata=json_data)
     except WebSocketDisconnect:
         print("WebSocket server disconnected")
 
